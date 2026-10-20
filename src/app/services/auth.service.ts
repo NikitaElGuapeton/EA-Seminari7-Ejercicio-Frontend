@@ -1,8 +1,7 @@
-import { HttpClient } from '@angular/common/http';
+import { HttpClient, HttpErrorResponse } from '@angular/common/http';
 import { Injectable, computed, inject, signal } from '@angular/core';
 import { Router } from '@angular/router';
-import { Observable, map, tap, throwError } from 'rxjs';
-
+import { Observable, catchError, finalize, map, of, switchMap, tap, throwError } from 'rxjs';
 import { environment } from '../../environments/environment';
 import {
   LoginRequest,
@@ -13,31 +12,7 @@ import {
   User,
 } from '../models';
 
-// Nombres con los que guardo la sesión en localStorage
-const TOKEN_KEY = 'token';
-const REFRESH_TOKEN_KEY = 'refreshToken';
-const USER_KEY = 'user';
 
-// Por qué localStorage y no una cookie HttpOnly (está explicado con más detalle en el README):
-// la API devuelve los tokens en el JSON del login, así que el frontend tiene que guardarlos él.
-// localStorage sobrevive a recargar la página y es fácil de entender. Su riesgo es que cualquier
-// script que se ejecute en la página puede leerlo (un ataque XSS). Una cookie HttpOnly no se puede
-// leer desde JavaScript, pero obliga a cambiar el backend y a protegerse de otro ataque (CSRF).
-
-// Al arrancar la app, recupero el usuario que dejó guardado el último login
-function readStoredUser(): User | null {
-  const stored = localStorage.getItem(USER_KEY);
-  if (!stored) {
-    return null;
-  }
-
-  try {
-    return JSON.parse(stored) as User;
-  } catch {
-    // Si alguien ha tocado el valor a mano y no es JSON, es como no tener sesión
-    return null;
-  }
-}
 
 @Injectable({ providedIn: 'root' })
 export class AuthService {
@@ -45,9 +20,11 @@ export class AuthService {
   private router = inject(Router);
   private baseUrl = `${environment.apiUrl}/auth`;
 
-  // El usuario con sesión, o null si no hay sesión. Es privado y modificable aquí dentro;
-  // fuera solo se puede leer (asReadonly), así nadie cambia la sesión sin pasar por este servicio
-  private currentUser = signal<User | null>(readStoredUser());
+  // El access token solo vive en memoria: al recargar la página se pierde y se recupera con /auth/refresh
+  private accessToken = signal<string | null>(null);
+
+  // El usuario también se mantiene en memoria
+  private currentUser = signal<User | null>(null);
   readonly user = this.currentUser.asReadonly();
 
   // computed: se recalculan solos cada vez que cambia el usuario
@@ -56,48 +33,78 @@ export class AuthService {
 
   /** POST /auth/register. No inicia sesión: la API no devuelve token y hay que hacer login */
   register(data: RegisterRequest): Observable<RegisterResponse> {
-    return this.http.post<RegisterResponse>(`${this.baseUrl}/register`, data);
+    // Permite que el navegador gestione cookies HttpOnly en las rutas de autenticación.
+    return this.http.post<RegisterResponse>(`${this.baseUrl}/register`, data, {
+      withCredentials: true,
+    });
   }
 
-  /** POST /auth/login. Si va bien, guarda los dos tokens y el usuario */
+  /** POST /auth/login. Si va bien, guarda el access token y el usuario en memoria */
   login(credentials: LoginRequest): Observable<LoginResponse> {
-    return this.http.post<LoginResponse>(`${this.baseUrl}/login`, credentials).pipe(
+    return this.http.post<LoginResponse>(`${this.baseUrl}/login`, credentials, {
+      withCredentials: true,
+    }).pipe(
       // tap: hago algo con la respuesta sin cambiarla; el componente la sigue recibiendo igual
       tap((response) => {
-        localStorage.setItem(TOKEN_KEY, response.token);
-        localStorage.setItem(REFRESH_TOKEN_KEY, response.refreshToken);
-        localStorage.setItem(USER_KEY, JSON.stringify(response.user));
+        // El access token se conserva solo en memoria para que JavaScript no lo persista en el navegador
+        this.accessToken.set(response.token);
         this.currentUser.set(response.user);
       }),
     );
   }
 
-  /** POST /auth/refresh. Pide un access token nuevo con el refresh token y lo guarda */
+  /** POST /auth/refresh. El navegador envía la cookie y el access token renovado se guarda en memoria */
   refresh(): Observable<string> {
-    const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY);
-    if (!refreshToken) {
-      return throwError(() => new Error('No hay refresh token'));
-    }
+    return this.http
+      .post<RefreshResponse>(`${this.baseUrl}/refresh`, {}, { withCredentials: true })
+      .pipe(
+        tap(({ token }) => this.accessToken.set(token)),
+        map(({ token }) => token),
+      );
+  }
 
-    return this.http.post<RefreshResponse>(`${this.baseUrl}/refresh`, { refreshToken }).pipe(
-      tap((response) => localStorage.setItem(TOKEN_KEY, response.token)),
-      // map: de la respuesta { token } me quedo solo con el texto del token
-      map((response) => response.token),
+    /** Recupera la sesión y el usuario al iniciar la aplicación */
+  initializeSession(): Observable<void> {
+    return this.refresh().pipe(
+      switchMap(() =>
+        this.http.get<User>(`${this.baseUrl}/me`, { withCredentials: true }),
+      ),
+      tap((user) => this.currentUser.set(user)),
+      map(() => undefined),
+      catchError((error: HttpErrorResponse) => {
+        if (error.status !== 401) {
+          return throwError(() => error);
+        }
+
+        // Si no hay una sesión válida, la aplicación empieza sin usuario ni access token
+        this.accessToken.set(null);
+        this.currentUser.set(null);
+        return of(undefined);
+      }),
     );
   }
 
-  /** Cierra la sesión: borra lo guardado y lleva al login */
+  /** Pide al backend que borre la cookie y limpia siempre la sesión local */
   logout(): void {
-    // Los tokens no se guardan en el servidor, así que cerrar sesión es olvidarlos aquí
-    localStorage.removeItem(TOKEN_KEY);
-    localStorage.removeItem(REFRESH_TOKEN_KEY);
-    localStorage.removeItem(USER_KEY);
-    this.currentUser.set(null);
-    this.router.navigate(['/login']);
+    this.http
+      .post<void>(`${this.baseUrl}/logout`, {}, { withCredentials: true })
+      .pipe(
+        // Aunque falle la petición, el frontend olvida el token y el usuario
+        finalize(() => {
+          this.accessToken.set(null);
+          this.currentUser.set(null);
+          void this.router.navigate(['/login']);
+        }),
+      )
+      .subscribe({
+        error: (error: unknown) => {
+          console.error('No se pudo completar el cierre de sesión', error);
+        },
+      });
   }
 
-  /** El access token guardado, o null si no hay sesión. Lo usa el interceptor */
+  /** Devuelve el access token en memoria para que el interceptor lo use en Authorization */
   getToken(): string | null {
-    return localStorage.getItem(TOKEN_KEY);
+    return this.accessToken();
   }
 }
