@@ -35,7 +35,6 @@ export class AuthService {
   register(data: RegisterRequest): Observable<RegisterResponse> {
     // Permite que el navegador gestione cookies HttpOnly en las rutas de autenticación.
     return this.http.post<RegisterResponse>(`${this.baseUrl}/register`, data, {
-      withCredentials: true,
     });
   }
 
@@ -67,9 +66,9 @@ export class AuthService {
   initializeSession(): Observable<void> {
     return this.refresh().pipe(
       switchMap(() =>
-        this.http.get<User>(`${this.baseUrl}/me`, { withCredentials: true }),
+        this.http.get<{ user: User }>(`${this.baseUrl}/me`, { withCredentials: true }),
       ),
-      tap((user) => this.currentUser.set(user)),
+      tap((res) => this.currentUser.set(res.user)),
       map(() => undefined),
       catchError((error: HttpErrorResponse) => {
         if (error.status !== 401) {
